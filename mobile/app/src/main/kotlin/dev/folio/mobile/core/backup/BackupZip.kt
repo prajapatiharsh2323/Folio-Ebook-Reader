@@ -1,0 +1,568 @@
+package dev.folio.mobile.core.backup
+
+import dev.folio.mobile.core.model.Manifest
+import dev.folio.mobile.core.util.sha256Hex
+import kotlinx.serialization.builtins.ListSerializer
+import java.io.File
+import java.io.FileOutputStream
+import java.io.InputStream
+import java.util.zip.CRC32
+import java.util.zip.Deflater
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+import java.util.zip.ZipOutputStream
+
+/**
+ * Kotlin port of packages/core/src/backup/{verify,export-zip.ts} (java.util.zip
+ * instead of fflate). The archive layout and safety limits are the PWA contract:
+ * - `backup.json` (BackupMeta) first
+ * - `library/manifest.json` (commit point, SHA-256 recorded in backup.json)
+ * - every file listed in the manifest's docs
+ * - `library/user/{annotations,progress,collections,settings}.json`
+ *
+ * Audit EPUB-007: archives enter the restore pipeline through [StagedArchive]
+ * (a temp file opened with ZipFile) so entries stream one at a time — the
+ * whole library never sits in RAM, mirroring the streaming exporter.
+ */
+
+/** §10 Safety limits: entry-name traversal, entry count and total size caps. */
+object BackupLimits {
+    const val MAX_ENTRIES = 20000
+    const val MAX_TOTAL_UNCOMPRESSED = 1024L * 1024L * 1024L // 1 GB
+
+    /** Per-entry uncompressed cap. Enforced DURING streaming (audit P0: a
+     *  hostile entry must abort before its bytes can pile up in the heap, not
+     *  only after they have). 512 MB is ~10× the 50 MB import cap, so no
+     *  schema-1 archive produced by Folio ever comes near it. */
+    const val MAX_ENTRY_UNCOMPRESSED = 512L * 1024L * 1024L
+
+    /** Tiny metadata entries are parsed into objects — capped hard. */
+    const val MAX_METADATA_UNCOMPRESSED = 16L * 1024L * 1024L
+
+    /** User-state JSON entries (annotations/progress/collections/settings). */
+    const val MAX_USER_STATE_UNCOMPRESSED = 64L * 1024L * 1024L
+
+    /** Entries parsed as metadata before verification concludes. */
+    val METADATA_ENTRIES = setOf("backup.json", "library/manifest.json")
+
+    /** Entries parsed as user state (byte-compatible PWA contract). */
+    val USER_STATE_ENTRIES = setOf(
+        "library/user/annotations.json",
+        "library/user/progress.json",
+        "library/user/collections.json",
+        "library/user/settings.json"
+    )
+}
+
+/**
+ * A per-verification limit set. Defaults to [BackupLimits]; tests inject
+ * smaller values so an over-limit abort can be exercised in milliseconds
+ * instead of streaming real 1 GB bombs.
+ */
+data class BackupLimitsSpec(
+    val maxEntries: Int,
+    val maxTotalUncompressed: Long,
+    val maxEntryUncompressed: Long,
+    val maxMetadataUncompressed: Long,
+    val maxUserStateUncompressed: Long,
+) {
+    companion object {
+        val DEFAULT = BackupLimitsSpec(
+            maxEntries = BackupLimits.MAX_ENTRIES,
+            maxTotalUncompressed = BackupLimits.MAX_TOTAL_UNCOMPRESSED,
+            maxEntryUncompressed = BackupLimits.MAX_ENTRY_UNCOMPRESSED,
+            maxMetadataUncompressed = BackupLimits.MAX_METADATA_UNCOMPRESSED,
+            maxUserStateUncompressed = BackupLimits.MAX_USER_STATE_UNCOMPRESSED,
+        )
+    }
+}
+
+/** Thrown when an entry's ACTUAL decompressed byte count exceeds its limit.
+ *  Counted from real streamed bytes, never trusted from ZIP metadata. */
+class EntryOversizeException(
+    val entryName: String,
+    val bytesRead: Long,
+    val limit: Long,
+) : RuntimeException("Entry '$entryName' expands past its limit: $bytesRead > $limit")
+
+/** Validates zip entry names against path traversal and drive-letter abuse. */
+fun checkPathSafety(entryName: String): Boolean {
+    if (entryName.isEmpty()) return false
+    if (entryName.startsWith("/") || entryName.startsWith("\\")) return false
+    if (entryName.contains("..")) return false
+    // Windows drive letter check (e.g. C:)
+    if (Regex("^[a-zA-Z]:").containsMatchIn(entryName)) return false
+    return true
+}
+
+private val STORE_SUFFIXES =
+    listOf(".epub", ".pdf", ".jpg", ".jpeg", ".png", ".webp")
+
+/** §8 Compression rules: store already-compressed binaries, deflate level 6 for the rest. */
+private fun useStore(path: String): Boolean =
+    STORE_SUFFIXES.any { path.lowercase().endsWith(it) }
+
+/** Standard backup filename: folio-backup-YYYYMMDD-HHMM.zip (local time).
+ *  Same bytes-format contract as the PWA's export-zip.ts, so backups from
+ *  either client share one naming scheme. */
+fun generateBackupFilename(now: java.util.Date = java.util.Date()): String =
+    java.text.SimpleDateFormat("'folio-backup-'yyyyMMdd-HHmm'.zip'", java.util.Locale.ROOT)
+        .format(now)
+
+/**
+ * A backup archive staged on disk. Entry contents are read from the staged
+ * file one at a time — nothing retains the whole archive in memory.
+ */
+class StagedArchive private constructor(
+    private val file: File,
+    private val deleteOnClose: Boolean
+) : AutoCloseable {
+
+    private val zip: ZipFile by lazy { ZipFile(file) }
+    private val namesCache by lazy {
+        val out = linkedSetOf<String>()
+        val en = zip.entries()
+        while (en.hasMoreElements()) out.add(en.nextElement().name)
+        out
+    }
+
+    /** Entry names in archive order (directories included). */
+    val entryNames: Set<String> get() = namesCache
+
+    fun entry(name: String): ZipEntry? = zip.getEntry(name)
+
+    fun hasEntry(name: String): Boolean = zip.getEntry(name) != null
+
+    /**
+     * Decompressed bytes of one entry (a few MB max for a single book file).
+     * Kept as a diagnostic/small-entry reader; verification and restore use
+     * the cap-aware [readEntryLimited] / [readEntryStreamed] below so no
+     * uncapped decompression path remains in the production pipeline.
+     */
+    fun readEntry(name: String): ByteArray? =
+        zip.getEntry(name)?.let { e -> zip.getInputStream(e).use { it.readBytes() } }
+
+    fun readTextEntry(name: String): String? =
+        readEntry(name)?.decodeToString()
+
+    /**
+     * Streams one entry through [consume] in BUFFER chunks, counting ACTUAL
+     * decompressed bytes. Returns the counted size (null = entry missing);
+     * throws [EntryOversizeException] the instant the count passes [limit] —
+     * the heap never holds more than one chunk of an oversized entry.
+     * "Count what really arrived" is the rule; a ZIP-declared entry size is
+     * only a cheap pre-flight hint and is never trusted over real bytes.
+     */
+    fun readEntryStreamed(
+        name: String,
+        limit: Long,
+        consume: (chunk: ByteArray, len: Int) -> Unit
+    ): Long? {
+        val entry = zip.getEntry(name) ?: return null
+        if (entry.size > 0 && entry.size > limit) {
+            throw EntryOversizeException(name, entry.size, limit)
+        }
+        val chunk = ByteArray(BUFFER)
+        var total = 0L
+        zip.getInputStream(entry).use { ins ->
+            while (true) {
+                val n = ins.read(chunk)
+                if (n < 0) break
+                if (n > 0) {
+                    total += n
+                    if (total > limit) {
+                        throw EntryOversizeException(name, total, limit)
+                    }
+                    consume(chunk, n)
+                }
+            }
+        }
+        return total
+    }
+
+    /**
+     * Whole-entry bytes read through the streaming counter with a hard cap:
+     * chunks accumulate only while the running total stays under [limit], so
+     * allocation is bounded by the configured cap.
+     */
+    fun readEntryLimited(name: String, limit: Long): ByteArray? {
+        val chunks = ArrayList<ByteArray>()
+        val size = readEntryStreamed(name, limit) { chunk, len ->
+            chunks += chunk.copyOf(len)
+        } ?: return null
+        val out = ByteArray(size.toInt())
+        var off = 0
+        for (c in chunks) {
+            c.copyInto(out, off)
+            off += c.size
+        }
+        return out
+    }
+
+    override fun close() {
+        runCatching { zip.close() }
+        if (deleteOnClose) file.delete()
+    }
+
+    companion object {
+        private const val BUFFER = 1 shl 16
+
+        /** Opens an existing zip file (never deleted on close). */
+        fun open(file: File): StagedArchive = StagedArchive(file, deleteOnClose = false)
+
+        /**
+         * Streams [input] into a temp file under [stagingDir] with a 64 KiB
+         * buffer, so a multi-hundred-MB backup never reaches the heap. The
+         * staged file is deleted on [close].
+         */
+        fun stage(input: InputStream, stagingDir: File): StagedArchive {
+            stagingDir.mkdirs()
+            val temp = File.createTempFile("folio-restore-", ".zip", stagingDir)
+            try {
+                FileOutputStream(temp).use { out ->
+                    val buf = ByteArray(BUFFER)
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n < 0) break
+                        out.write(buf, 0, n)
+                    }
+                    out.flush()
+                    out.fd.sync()
+                }
+                return StagedArchive(temp, deleteOnClose = true)
+            } catch (t: Throwable) {
+                temp.delete()
+                throw t
+            }
+        }
+    }
+}
+
+/**
+ * Streams the staged archive with per-entry safety checks and verifies every
+ * manifest-listed file against its SHA-256 (verify.ts semantics: unsafe paths
+ * are recorded, corrupt archives return `valid = false` with a single
+ * `corrupted` issue). Contents stay on disk — only one entry byte-buffer at
+ * a time is in memory.
+ */
+fun unzipAndVerifyBackup(
+    archive: StagedArchive,
+    limits: BackupLimitsSpec = BackupLimitsSpec.DEFAULT
+): VerificationResult {
+    val issues = mutableListOf<VerificationIssue>()
+    val digests = HashMap<String, String>()
+    var totalFiles = 0
+    var totalSize = 0L
+
+    var metMeta: String? = null
+    var metManifest: String? = null
+
+    /** Limit for one entry: min of its class cap, the per-entry cap and the
+     *  remaining share of the total cap. Null = the total cap is already
+     *  spent (caller reports total-size excess without another read). */
+    fun limitFor(name: String): Long? {
+        val remaining = limits.maxTotalUncompressed - totalSize
+        if (remaining <= 0) return null
+        val classCap = when {
+            name in BackupLimits.METADATA_ENTRIES -> limits.maxMetadataUncompressed
+            name in BackupLimits.USER_STATE_ENTRIES -> limits.maxUserStateUncompressed
+            else -> Long.MAX_VALUE
+        }
+        return minOf(classCap, limits.maxEntryUncompressed, remaining)
+    }
+
+    run unzip@{
+        try {
+            for (name in archive.entryNames) {
+                val entry = archive.entry(name) ?: continue
+                if (!checkPathSafety(name)) {
+                    issues.add(
+                        VerificationIssue(
+                            path = name, reason = "unsafe_path",
+                            message = "Unsafe archive path detected: $name"
+                        )
+                    )
+                    continue
+                }
+                if (entry.isDirectory) continue
+                totalFiles++
+                if (totalFiles > limits.maxEntries) {
+                    issues.add(
+                        VerificationIssue(
+                            path = "<archive>", reason = "corrupted",
+                            message = "Archive exceeds maximum entry count of ${limits.maxEntries}"
+                        )
+                    )
+                    return@unzip
+                }
+                val limit = limitFor(name)
+                if (limit == null) {
+                    issues.add(
+                        VerificationIssue(
+                            path = "<archive>", reason = "corrupted",
+                            message = "Archive exceeds maximum uncompressed size of ${limits.maxTotalUncompressed / (1024L * 1024L)} MB"
+                        )
+                    )
+                    return@unzip
+                }
+
+                // Streaming verification: document chunks pass through an
+                // incremental SHA-256 only; the entry is NEVER held in the heap
+                // (audit P0: size limits enforced on real decompressed bytes as
+                // they arrive, not after a full ByteArray already exists).
+                val maybeOversize: EntryOversizeException? = try {
+                    val md = java.security.MessageDigest.getInstance("SHA-256")
+                    val size = archive.readEntryStreamed(name, limit) { chunk, len ->
+                        md.update(chunk, 0, len)
+                    }
+                    if (size == null) continue
+                    digests[name] = md.digest().joinToString("") { String.format("%02x", it) }
+                    totalSize += size
+                    if (name in BackupLimits.METADATA_ENTRIES || name in BackupLimits.USER_STATE_ENTRIES) {
+                        // Metadata/user state must be parseable — re-read it
+                        // (bounded by the same limit) into bytes for parsing.
+                        val bytes = archive.readEntryLimited(name, limit)
+                        if (bytes != null) {
+                            when (name) {
+                                "backup.json" -> metMeta = bytes.decodeToString()
+                                "library/manifest.json" -> metManifest = bytes.decodeToString()
+                            }
+                            digests[name] = sha256Hex(bytes)
+                        }
+                    }
+                    null
+                } catch (oversize: EntryOversizeException) {
+                    oversize
+                } catch (e: java.util.zip.ZipException) {
+                    // CRC/local-header mismatch on any entry makes the whole
+                    // archive untrustworthy.
+                    issues.add(
+                        VerificationIssue(
+                            path = "<archive>", reason = "corrupted",
+                            message = "Archive failed to unzip: ${e.message}"
+                        )
+                    )
+                    return@unzip
+                }
+                if (maybeOversize != null) {
+                    // Which constraint was the smaller limit when the stream
+                    // aborted decides the user-facing story: an entry that
+                    // overshoots the REMAINING total budget means the archive
+                    // is genuinely too big; an entry under its own cap means
+                    // that single entry alone is hostile.
+                    val remaining = limits.maxTotalUncompressed - totalSize
+                    val limitedByTotal = maybeOversize.limit >= remaining
+                    issues.add(
+                        VerificationIssue(
+                            path = "<archive>", reason = "corrupted",
+                            message = if (limitedByTotal)
+                                "Archive exceeds maximum uncompressed size of ${limits.maxTotalUncompressed / (1024L * 1024L)} MB"
+                            else
+                                "Archive entry '${maybeOversize.entryName}' expands past the maximum allowed ${maybeOversize.limit} bytes"
+                        )
+                    )
+                    return@unzip
+                }
+            }
+        } catch (e: java.util.zip.ZipException) {
+            // Central-directory level corruption.
+            issues.add(
+                VerificationIssue(
+                    path = "<archive>", reason = "corrupted",
+                    message = "Archive failed to unzip: ${e.message}"
+                )
+            )
+        }
+    }
+    if (issues.any { it.path == "<archive>" }) {
+        return VerificationResult(
+            valid = false,
+            issues = issues,
+            totalFiles = totalFiles,
+            totalSize = totalSize,
+            warnings = issues.map { it.message }
+        )
+    }
+
+    var backupMeta: BackupMeta? = try {
+        metMeta?.takeIf { it.isNotBlank() }?.let { parseBackupMeta(it) }
+    } catch (_: Exception) {
+        null
+    }
+    if (metMeta != null && backupMeta == null) {
+        issues.add(
+            VerificationIssue(
+                path = "backup.json", reason = "corrupted",
+                message = "Failed to parse backup.json metadata"
+            )
+        )
+    }
+
+    // 2. Parse library/manifest.json (mandatory).
+    val manifest = metManifest?.let { runCatching { parseManifest(it) }.getOrNull() }
+    if (metManifest == null) {
+        issues.add(
+            VerificationIssue(
+                path = "library/manifest.json", reason = "missing_in_archive",
+                message = "library/manifest.json not found in backup archive"
+            )
+        )
+        return VerificationResult(
+            valid = false,
+            backupMeta = backupMeta,
+            issues = issues,
+            totalFiles = totalFiles,
+            totalSize = totalSize,
+            warnings = issues.map { it.message }
+        )
+    }
+    if (manifest == null) {
+        issues.add(
+            VerificationIssue(
+                path = "library/manifest.json", reason = "corrupted",
+                message = "Failed to parse library/manifest.json"
+            )
+        )
+        return VerificationResult(
+            valid = false,
+            backupMeta = backupMeta,
+            issues = issues,
+            totalFiles = totalFiles,
+            totalSize = totalSize,
+            warnings = issues.map { it.message }
+        )
+    }
+
+    // 3. Verify the manifest's sha256 against backup.json when present.
+    backupMeta?.let { meta ->
+        if (meta.manifestSha256.isNotBlank()) {
+            val computed = sha256Hex(metManifest!!.encodeToByteArray())
+            if (computed != meta.manifestSha256) {
+                issues.add(
+                    VerificationIssue(
+                        path = "library/manifest.json", reason = "checksum_mismatch",
+                        expectedSha256 = meta.manifestSha256, actualSha256 = computed,
+                        message = "Manifest SHA-256 does not match backup.json"
+                    )
+                )
+            }
+        }
+    }
+
+    // 4. Verify each document file against manifest checksums (streamed digests).
+    for (doc in manifest.docs) {
+        for (f in doc.files) {
+            val actual = digests[f.path]
+            if (actual == null) {
+                issues.add(
+                    VerificationIssue(
+                        path = f.path, reason = "missing_in_archive",
+                        expectedSha256 = f.sha256,
+                        message = "File listed in manifest is missing from backup: ${f.path}"
+                    )
+                )
+                continue
+            }
+            if (actual != f.sha256) {
+                issues.add(
+                    VerificationIssue(
+                        path = f.path, reason = "checksum_mismatch",
+                        expectedSha256 = f.sha256, actualSha256 = actual,
+                        message = "Checksum mismatch for ${f.path}"
+                    )
+                )
+            }
+        }
+    }
+
+    return VerificationResult(
+        valid = issues.isEmpty(),
+        backupMeta = backupMeta,
+        issues = issues,
+        totalFiles = totalFiles,
+        totalSize = totalSize,
+        warnings = issues.map { it.message }
+    )
+}
+
+/** Streams a full backup ZIP to [out], reading each file individually so the
+ *  whole library never sits in memory (PWA export-zip.ts contract). */
+suspend fun exportBackupZip(
+    library: dev.folio.mobile.core.store.FileStore,
+    out: java.io.OutputStream,
+    onProgress: ((current: Int, total: Int, filename: String) -> Unit)? = null
+): BackupMeta {
+    val manifest = parseManifest(library.readText(dev.folio.mobile.core.library.MANIFEST_PATH))
+
+    // Deterministic file set (no duplicates) + files missing on disk dropped.
+    val files = LinkedHashSet<String>()
+    val sanitizedDocs = manifest.docs.map { doc ->
+        val present = doc.files.filter { f ->
+            val ok = library.exists(f.path)
+            if (ok) {
+                files.add(f.path)
+            } else {
+                java.util.logging.Logger.getLogger("BackupExport")
+                    .warning("exportBackup: missing file for doc ${doc.id}: ${f.path}")
+            }
+            ok
+        }
+        doc.copy(files = present)
+    }
+    for (d in manifest.docs) {
+        val metaPath = "library/docs/${d.slug}/meta.json"
+        if (library.exists(metaPath)) files.add(metaPath)
+    }
+    val userFiles = listOf(
+        "library/user/annotations.json",
+        "library/user/progress.json",
+        "library/user/collections.json",
+        "library/user/settings.json"
+    )
+    for (uf in userFiles) {
+        if (library.exists(uf)) files.add(uf)
+    }
+
+    val exportManifest = manifest.copy(
+        docs = sanitizedDocs,
+        updatedAt = java.time.Instant.now().toString()
+    )
+    val manifestBytes = backupJson.encodeToString(Manifest.serializer(), exportManifest).encodeToByteArray()
+    val meta = BackupMeta(
+        createdAt = java.time.Instant.now().toString(),
+        appVersion = "0.1.0",
+        docCount = sanitizedDocs.size,
+        manifestSha256 = sha256Hex(manifestBytes)
+    )
+
+    val zipStream = ZipOutputStream(out.buffered())
+    zipStream.setLevel(Deflater.DEFAULT_COMPRESSION)
+
+    fun add(name: String, data: ByteArray) {
+        val entry = ZipEntry(name)
+        if (useStore(name)) {
+            val crc = CRC32().apply { update(data) }
+            entry.method = ZipEntry.STORED
+            entry.size = data.size.toLong()
+            entry.compressedSize = data.size.toLong()
+            entry.crc = crc.value
+        } else {
+            entry.method = ZipEntry.DEFLATED
+        }
+        zipStream.putNextEntry(entry)
+        zipStream.write(data)
+        zipStream.closeEntry()
+    }
+
+    add("backup.json", backupJson.encodeToString(BackupMeta.serializer(), meta).encodeToByteArray())
+    add("library/manifest.json", manifestBytes)
+
+    val paths = files.toList()
+    for ((index, path) in paths.withIndex()) {
+        onProgress?.invoke(index + 1, paths.size + 1, path)
+        add(path, library.read(path))
+    }
+    zipStream.finish()
+    zipStream.flush()
+    return meta
+}
