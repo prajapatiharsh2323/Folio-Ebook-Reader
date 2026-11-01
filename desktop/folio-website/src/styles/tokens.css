@@ -1,0 +1,173 @@
+/* ============================================================
+ * Folio marketing site — design tokens
+ * Reused from the app's theme (mobile/android token surface);
+ * scoped intentionally to the public website so the Tauri app
+ * is never coupled to this static project.
+ * ============================================================ */
+
+:root {
+  /* ---- Brand tokens (warm paper / deep evergreen / sage) ---- */
+  --paper-canvas: #f7f6f1;   /* main page canvas */
+  --surface: #fffefb;        /* elevated panels */
+  --subtle-panel: #f1f0e9;   /* inputs, quiet panels */
+  --deep-ink: #22251f;       /* primary text */
+  --evergreen: #355847;      /* primary accent */
+  --evergreen-dark: #294638; /* pressed accent */
+  --sage-tint: #e2eae1;      /* selected/pressed ink banks */
+  --paper-border: #e1e0d6;   /* thin warm hairlines */
+
+  /* ---- Dark reading atmosphere (selective sections only) ---- */
+  --dark-canvas: #141713;
+  --dark-surface: #1c211c;
+  --dark-surface-subtle: #242b24;
+  --dark-ink: #ecefef;
+  --dark-ink-soft: #b2b7ab;
+  --dark-ink-muted: #8d968a;
+  --dark-border: #343d35;
+  --dark-sage: #a7c4a6;
+  --dark-sage-bright: #bed4bb;
+
+  /* ---- Theme machinery + semantic app UI roles ---- */
+  --bg: var(--paper-canvas);
+  --surface-0: var(--surface);
+  --surface-1: var(--subtle-panel);
+  --text: var(--deep-ink);
+  --text-secondary: #676a61;
+  --text-muted: #87897f;
+  --border: var(--paper-border);
+  --accent: var(--evergreen);
+  --accent-pressed: var(--evergreen-dark);
+  --accent-ink: var(--surface);
+  --page: var(--paper-canvas);
+  --page-ink: var(--deep-ink);
+  --page-surface: #ffffff;
+  --page-muted: #6b6860;
+  --page-border: #e6e3dc;
+
+  /* reader preview banks — mirror ReaderPrefsMapper THEME_COLORS */
+  --reader-light: #fafaf7;
+  --reader-light-ink: #1c1b19;
+  --reader-warm: #f4ecd8;
+  --reader-warm-ink: #3b3226;
+  --reader-dark: #121214;
+  --reader-dark-ink: #e6e3dc;
+  --reader-trueblack: #000000;
+  --reader-tb-ink: #c8c4bc;
+
+  /* ---- Type ---- */
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji", sans-serif;
+  --font-serif: Georgia, "Iowan Old Style", "Times New Roman", serif;
+
+  /* ---- Spacing (4px scale) ---- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+  --space-20: 80px;
+  --space-24: 96px;
+
+  /* ---- Radii (8–12px buttons, 14–16px panels, preserves cover rectangles) ---- */
+  --radius-btn: 10px;
+  --radius-panel: 14px;
+  --radius-actions: 16px;
+  --radius-sm: 8px;
+
+  /* ---- Motion (reused rhythm, not new behavior) ---- */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out: cubic-bezier(0.45, 0, 0.55, 1);
+  --duration-hover: 140ms;
+  --duration-panel: 220ms;
+  --duration-page: 300ms;
+  --duration-focus: 180ms;
+
+  /* ---- Misc ---- */
+  --max-width: 1120px;
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* Respect reduced motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background-color: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-feature-settings: "cv02", "cv03", "cv04", "kern";
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Base, editorial text scale. */
+p,
+ol,
+ul,
+dl,
+blockquote {
+  margin: 0 0 var(--space-5) 0;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-serif);
+  font-weight: 600;
+  line-height: 1.15;
+  color: var(--deep-ink);
+  margin: 0 0 var(--space-4) 0;
+}
+
+a {
+  color: var(--evergreen);
+  text-decoration: none;
+}
+
+a:hover {
+  color: var(--evergreen-dark);
+}
+
+img {
+  display: block;
+  max-width: 100%;
+}
+
+ul,
+ol {
+  padding-left: var(--space-5);
+}
+
+button {
+  font-family: inherit;
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  border: 1px solid var(--paper-border);
+  background: var(--surface);
+  color: var(--deep-ink);
+}
+
+button:focus-visible {
+  outline: 2px solid var(--evergreen);
+  outline-offset: 2px;
+}
+
+:focus-visible {
+  outline: 2px solid var(--evergreen);
+  outline-offset: 2px;
+}

@@ -1,0 +1,29 @@
+/* ============================================================
+ * Light scroll-reveal animations
+ * Reused motion rhythm: 140ms hover, 220ms panels, 300ms pages.
+ * Use on hero visuals, feature blocks and preview cards only —
+ * never on the reading page itself.
+ * ============================================================ */
+
+.reveal {
+  opacity: 0;
+  transform: translateY(14px);
+  transition:
+    opacity 300ms var(--ease-out),
+    transform 300ms var(--ease-out);
+}
+
+.reveal.in-view {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.reveal--hover {
+  transition:
+    transform var(--duration-hover) var(--ease-out),
+    box-shadow var(--duration-hover) var(--ease-out);
+}
+
+.reveal--hover:hover {
+  transform: translateY(-2px);
+}
