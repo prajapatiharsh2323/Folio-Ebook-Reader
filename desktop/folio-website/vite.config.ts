@@ -3,10 +3,5 @@ import react from "@vitejs/plugin-react";
 
 export default defineConfig({
   plugins: [react()],
-  build: {
-    rollupOptions: {
-      input: "./public/index.html",
-    },
-  },
   envPrefix: ["VITE_"],
 });
